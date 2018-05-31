@@ -10,7 +10,8 @@ The input is a list of stars' photometry, parallaxes, and associated uncertainti
 
 Typical usage is something like:
 ```
-res = gaiared.fit_model(mag, dmag, parallax, dparallax, teff, logz, logg, extprior, extpriorsig, nextcomp=2, fitgrav=True, order=4, logg_prior_mean=logg, logg_prior_sigma=dlogg)
+res = gaiared.fit_model(mag, dmag, parallax, dparallax, teff, logz, logg, extprior, extpriorsig, nextcomp=2, 
+                        fitgrav=True, order=4, logg_prior_mean=logg, logg_prior_sigma=dlogg)
 intmagpar, extcurvepar, mus, loggs = gaiared.unwrap_param(res, nband, nintmagpar, len(parallax), 2, fitgrav=True)
 ``` 
 though the code is in an exploratory state.  In the above example, the gravities are not taken as fixed, and are instead fit (fitgrav=True).  In this case, they require priors from the spectroscopy (logg_prior_mean, logg_prior_sigma).  Some kind of extinction prior is required to remove normalization and zero point degeneracies.
