@@ -42,6 +42,8 @@ import pdb
 # the normalization issue.  It only needs to be for a subset of stars and
 # bands.
 
+parnames = ['teff', 'logz', 'logg']
+
 def compute_multinomials(order=3):
     """Computes relevant multinomial coefficients for use in modelmag."""
     
@@ -59,8 +61,8 @@ def compute_multinomials(order=3):
     return xpows, ypows, zpows
     
 
-def modelmag(par, teff, logz, logg, nband=13, reset=False, gradient=False,
-             fitgrav=False, order=3):
+def modelmag(par, starpar, nband=13, reset=False, gradient=False,
+             fitpar=[], order=3):
     """Returns intrinsic magnitudes according to some parameters describing
     the isochrones, and the temperature, metallicity, and gravity of
     the stars."""
@@ -69,68 +71,75 @@ def modelmag(par, teff, logz, logg, nband=13, reset=False, gradient=False,
     if reset or getattr(self, 'xpows', None) is None:
         self.xpows, self.ypows, self.zpows = compute_multinomials(order=order)
 
-    x = (teff - 4600)/1000.
-    y = logg - 2
-    z = logz + 0.5
+    x = (starpar['teff'] - 4600)/1000.
+    y = starpar['logg'] - 2
+    z = starpar['logz'] + 0.5
     par = par.reshape(nband, -1)
     if par.shape[-1] != len(self.xpows):
         raise ValueError('shape of par does not match expectations.')
-    res = numpy.zeros((len(teff), nband), dtype='f8')
+    nstar = len(starpar['teff'])
+    res = numpy.zeros((nstar, nband), dtype='f8')
     if gradient:
         grad = getattr(self, 'grad', None)
         if (reset or (grad is None) or 
-            (grad.shape != (len(teff), nband, par.shape[-1]))):
-            grad = numpy.zeros((par.shape[-1], nband, len(teff)), 
+            (grad.shape != (nstar, nband, par.shape[-1]))):
+            grad = numpy.zeros((par.shape[-1], nband, nstar), 
                                dtype='f8').T
             self.grad = grad
-        if fitgrav:
-            gradg = getattr(self, 'gradg', None)
-            if (reset or (gradg is None) or 
-                (gradg.shape != (len(teff), nband))):
-                gradg = numpy.zeros((nband, len(teff)), 
-                                    dtype='f8').T
-                self.gradg = gradg
+        for parname in fitpar:
+            gradpar = getattr(self, 'grad%s' % parname, None)
+            if (reset or (gradpar is None) or 
+                (gradpar.shape != (nband, nstar))):
+                gradpar = numpy.zeros((nband, nstar), dtype='f8').T
+                setattr(self, 'grad%s' % parname, gradpar)
     if gradient:
         grad[...] = 0.
-        if fitgrav:
-            gradg[...] = 0.
+        for parname in fitpar:
+            gradpar = getattr(self, 'grad%s' % parname)
+            gradpar[...] = 0.
     for i, (xpow, ypow, zpow) in enumerate(zip(
             self.xpows, self.ypows, self.zpows)):
         xyz = x**xpow * y**ypow * z**zpow
         res += par[:, i].reshape(1, -1)*xyz.reshape(-1, 1)
         if gradient:
             grad[:, :, i] = xyz[:, None]
-            if fitgrav:
-                gradg += (
+            if 'teff' in fitpar:
+                self.gradteff += (
                     par[:, i].reshape(1, -1)*
-                    (x**xpow*(ypow)*y**numpy.clip(ypow-1, 0, numpy.inf)*
+                    (xpow*x**numpy.clip(xpow-1, 0, numpy.inf)*y**ypow*
                      z**zpow).reshape(-1, 1))
-    # if we want to introduce T, logz, logg uncertainty, then
-    # we also need to do derivatives with respect to these parameters.
-    # that means xpow*(x**(xpow-1))*y**ypow*z**zpow
+            if 'logg' in fitpar:
+                self.gradlogg += (
+                    par[:, i].reshape(1, -1)*
+                    (x**xpow*ypow*y**numpy.clip(ypow-1, 0, numpy.inf)*
+                     z**zpow).reshape(-1, 1))
+            if 'logz' in fitpar:
+                self.gradlogz += (
+                    par[:, i].reshape(1, -1)*
+                    (x**xpow*y**ypow*
+                     zpow*z**numpy.clip(zpow-1, 0, numpy.inf)).reshape(-1, 1))
     if gradient:
-        if fitgrav:
-            return res, (grad, gradg)
-        else:
-            return res, grad
+        gradout = {'int': grad}
+        for parname in fitpar:
+            gradout[parname] = getattr(self, 'grad%s' % parname)
+        return res, gradout
     else:
         return res
 
 
-def fullmodel(intmagpar, extcurvepar, extinctions, mus, 
-              teff, logz, logg, nband=13, gradient=False,
-              extfun=None, fitgrav=False, order=3):
-    absmag = modelmag(intmagpar, teff, logz, logg, nband=nband, 
-                      gradient=gradient, fitgrav=fitgrav, order=order)
+def fullmodel(intmagpar, extcurvepar, starpar,
+              nband=13, gradient=False,
+              extfun=None, fitpar=[], order=3):
+    absmag = modelmag(intmagpar, starpar, nband=nband, 
+                      gradient=gradient, fitpar=fitpar, order=order)
     if gradient:
         absmag, gradabsmag = absmag
     nextcomp = extcurvepar.shape[0]
-    dumbfactor = 1
-    # setting dumbfactor > 1 turns off R normalization
-    # testing only!
+    normstart = 1
+    gradstarpar = {}
     for i in range(nextcomp):
-        fac = 1 if i < dumbfactor else numpy.sqrt(numpy.sum(extcurvepar[i]**2))
-        absmag += extcurvepar[None, i, :]*extinctions[i][:, None]/fac
+        fac = 1 if i < normstart else numpy.sqrt(numpy.sum(extcurvepar[i]**2))
+        absmag += extcurvepar[None, i, :]*starpar['extinction'][:, i, None]/fac
     if gradient:
         # by introducing a normalization factor into the
         # extinction curve parameters, we go from grad_{R_i} = x*(i==j)
@@ -141,66 +150,69 @@ def fullmodel(intmagpar, extcurvepar, extinctions, mus,
         rirjfac = numpy.zeros((nextcomp, nband, nband), dtype='f8')
         for i in range(nextcomp):
             rirjfac[i] = numpy.eye(nband, nband)
-            if i > dumbfactor-1:
+            if i >= normstart:
                 r0 = extcurvepar[i]
                 fac = numpy.sqrt(numpy.sum(r0**2))
                 rirjfac[i] /= fac
                 rirjfac[i] -= r0.reshape(-1,1)*r0.reshape(1, -1)/fac**3
-        gradextcurve = [extinctions, rirjfac]
-        gradextinctions = extcurvepar.copy()
-        for i in range(dumbfactor, nextcomp):
-            fac = numpy.sqrt(numpy.sum(gradextinctions[i]**2.))
-            gradextinctions[i] /= fac
+        gradextcurve = [starpar['extinction'].T, rirjfac]
+        gradstarpar['extinction'] = extcurvepar.copy()
+        for i in range(normstart, nextcomp):
+            fac = numpy.sqrt(numpy.sum(gradstarpar['extinction'][i]**2.))
+            gradstarpar['extinction'][i] /= fac
     if extfun:
-        nomextinctions = extfun(extinctions[0], teff, logz, logg, 
+        # this block needs to be looked at again.
+        # the nominal extinctions need to be added to the absolute magnitudes.
+        # check what's going on with the gradient calculations
+        # this is clearly not done yet!
+        raise NotImplementedError('this is not done yet!')
+        nomextinctions = extfun(starpar['extinction'][0], starpar['teff'],
+                                starpar['logz'], starpar['logg'],
                                 gradient=gradient)
         if gradient:
             nomextinctions, gradnomextinctions = nomextinctions
-            gradextinctions = (gradextinctions[None, :, :]*
-                               numpy.ones((nomextictions.shape[0], 1, 1)))
-            gradextinctions[:, 0, :] += nomextinctions
-    absmag += mus.reshape(-1, 1)
+            gradstarpar['extinction'] = (
+                gradstarpar['extinction'][None, :, :] *
+                numpy.ones((nomextictions.shape[0], 1, 1)))
+            gradstarpar['extinction'][:, 0, :] += gradnomextinctions
+    absmag += starpar['mu'].reshape(-1, 1)
     if gradient:
-        gradmu = numpy.array([1], dtype='f8').reshape(1, 1)
+        gradstarpar['mu'] = numpy.array([1], dtype='f8').reshape(1, 1)
     if gradient:
-        return absmag, gradabsmag, gradextcurve, gradextinctions, gradmu
+        return absmag, gradabsmag, gradextcurve, gradstarpar
     else:
         return absmag
 
 
-def fullmodel_chi2(mag, dmag, parallax, dparallax, intmagpar, extcurvepar, 
-                   extinctions, mus, teff, logz, logg, extinction_prior_mean,
-                   extinction_prior_sigma,
-                   nband=13, gradient=False, fitgrav=False, damp=3,
-                   logg_prior_mean=None, logg_prior_sigma=None, order=3):
-    tmodelmag = fullmodel(intmagpar, extcurvepar, extinctions, mus, 
-                          teff, logz, logg, nband=nband, gradient=gradient,
-                          fitgrav=fitgrav, order=order)
+def fullmodel_chi2(star, intmagpar, extcurvepar, starpar,
+                   nband=13, gradient=False, fitpar=[], damp=3,
+                   order=3, apply_extcurvenormprior=True):
+    for parname in parnames:
+        if parname not in starpar:
+            starpar[parname] = star[parname]
+    tmodelmag = fullmodel(intmagpar, extcurvepar, starpar, 
+                          nband=nband, gradient=gradient,
+                          fitpar=fitpar, order=order)
     if gradient:
-        (tmodelmag, gradabsmag, gradextcurve, gradextinctions, 
-         gradmu) = tmodelmag
-        if fitgrav:
-            gradabsmag, gradg = gradabsmag
-    # the gradient bit of this is huge.
-    # we only need it after taking the sum, though, so it's okay...
-    chimag = damper((mag-tmodelmag)/dmag, damp)
+        (tmodelmag, gradabsmag, gradextcurve, gradstarpar) = tmodelmag
+    chimag = damper((star['mag']-tmodelmag)/star['dmag'], damp)
     # dimensions: npar, nstar, nband
     if gradient:
-        dfdchiodmag = damper_deriv((mag-tmodelmag)/dmag, damp)/dmag
+        dfdchiodmag = damper_deriv((star['mag']-tmodelmag)/star['dmag'], 
+                                   damp)/star['dmag']
         # needs to be multiplied into gradient correctly.
         nintmagpar = intmagpar.shape[0]*intmagpar.shape[1]
         nextcurvepar = extcurvepar.shape[0]*extcurvepar.shape[1]
-        nextinctions = extinctions.shape[0]*extinctions.shape[1]
-        nstar = mus.shape[0]
-        npar = (nintmagpar + nextcurvepar + nextinctions + nstar)
-        if fitgrav:
-            npar += nstar
-        # nstar <-> mu; needs to go to 4*nstar eventually to incorporate
-        # teff, logz, logg
+        nextinctions = (starpar['extinction'].shape[0] *
+                        starpar['extinction'].shape[1])
+        nstar = starpar['mu'].shape[0]
+        npar = (nintmagpar + nextcurvepar + nextinctions + 
+                nstar*(len(fitpar)+1))
         delchi2 = numpy.zeros(npar, dtype='f8')
         i = 0
         delchi2[0:nintmagpar] = -2*numpy.einsum(
-            'ij,ij,ijk->jk', chimag, dfdchiodmag, gradabsmag).reshape(-1)
+            'ij,ij,ijk->jk', chimag, dfdchiodmag, 
+            gradabsmag['int']).reshape(-1)
         i += nintmagpar
         extcurveparstart, extcurveparend = i, i+nextcurvepar
         delchi2[i:i+nextcurvepar] = -2*numpy.einsum(
@@ -209,30 +221,33 @@ def fullmodel_chi2(mag, dmag, parallax, dparallax, intmagpar, extcurvepar,
         i += nextcurvepar
         extstart, extend = i, i+nextinctions
         delchi2[i:i+nextinctions] = -2*numpy.sum(chimag*dfdchiodmag*
-            gradextinctions[:, None, :], axis=2).reshape(-1)
+            gradstarpar['extinction'][:, None, :], axis=2).reshape(-1)
         i += nextinctions
         mustart, muend = i, i+nstar
-        delchi2[i:i+nstar] = -2*numpy.sum(chimag*dfdchiodmag*gradmu, 
-                                         axis=1)
+        delchi2[i:i+nstar] = -2*numpy.sum(chimag*dfdchiodmag*gradstarpar['mu'],
+                                          axis=1)
         i += nstar
-        loggparstart = i
-    chiparallax = damper((parallax-mu_to_parallax(mus))/dparallax, damp)
+        specparstart = i
+    chiparallax = damper((star['parallax']-mu_to_parallax(starpar['mu']))/
+                         star['dparallax'], damp)
     if gradient:
-        dfdchiparallax = damper_deriv((parallax-mu_to_parallax(mus))/dparallax, 
-                                      damp)
-        gradparallax = -numpy.log(10)/5*100*10**(-mus/5)
+        dfdchiparallax = damper_deriv(
+            (star['parallax']-mu_to_parallax(starpar['mu']))/star['dparallax'],
+            damp)
+        gradparallax = -numpy.log(10)/5*100*10**(-starpar['mu']/5)
         delchi2[mustart:muend] += (
-            -2*chiparallax*dfdchiparallax*gradparallax/dparallax)
+            -2*chiparallax*dfdchiparallax*gradparallax/star['dparallax'])
     chi2 = numpy.sum(chimag**2)+numpy.sum(chiparallax**2)
-    if len(extinctions) > 0:
-        extchi = (extinction_prior_mean-extinctions)/extinction_prior_sigma
+    if starpar['extinction'].shape[1] > 0:
+        extchi = ((star['extprior']-starpar['extinction'])/
+                  star['extpriorsig'])
         extchidamp = damper(extchi, damp)
         dfdchi = damper_deriv(extchi, damp)
         chi2 += numpy.sum(extchidamp**2)
         if gradient:
             delchi2[extstart:extend] += (
-                -2*extchidamp*dfdchi/extinction_prior_sigma).reshape(-1)
-    if len(extcurvepar) > 1:
+                -2*extchidamp*dfdchi/star['extpriorsig']).reshape(-1)
+    if apply_extcurvenormprior and (len(extcurvepar) > 1):
         unit2normsigma = 0.1
         # chi = (1-numpy.sum(extcurvepar[1]**2))/unit2normsigma
         norm2 = numpy.sum(extcurvepar[1]**2.)
@@ -244,14 +259,15 @@ def fullmodel_chi2(mag, dmag, parallax, dparallax, intmagpar, extcurvepar,
         if len(extcurvepar) > 2:
             raise ValueError('Have not thought about normalization in '
                              'nextcomp > 2 case.')
-    if fitgrav:
-        chi = (logg_prior_mean-logg)/logg_prior_sigma
-        chi2 += numpy.sum(chi**2)
-        if gradient:
-            delchi2[loggparstart:loggparstart+nstar] = -2*numpy.sum(
-                chimag*dfdchiodmag*gradg, axis=1)
-            delchi2[loggparstart:loggparstart+nstar] += (
-                -2*chi/logg_prior_sigma)
+    i = specparstart
+    for parname in parnames:
+        if parname in fitpar:
+            chi = (star[parname]-starpar[parname])/star['d%s' % parname]
+            chi2 += numpy.sum(chi**2.)
+            if gradient:
+                delchi2[i:i+nstar] = -2*numpy.sum(
+                    chimag*dfdchiodmag*gradabsmag[parname], axis=1)
+                delchi2[i:i+nstar] += -2*chi/star['d%s' % parname]
     if gradient:
         return chi2, delchi2
     else:
@@ -283,7 +299,7 @@ def make_bad_mock_data(nband=13, nstar=10000, nextcomp=2, order=3):
     intmagpar = numpy.random.randn(nband, nintmagpar)
     extcurvepar = numpy.random.randn(nextcomp, nband)
     extcurvepar /= numpy.sqrt(numpy.sum(extcurvepar**2, axis=1)).reshape(-1, 1)
-    extinctions = numpy.random.randn(nextcomp, nstar)
+    extinctions = numpy.random.randn(nstar, nextcomp)
     mus = numpy.random.randn(nstar)+10
     teff = numpy.random.randn(nstar)*1000+4600
     logz = numpy.random.randn(nstar)
@@ -301,40 +317,47 @@ def make_bad_mock_data(nband=13, nstar=10000, nextcomp=2, order=3):
             teff, logz, logg, mus, extinctions, intmagpar, extcurvepar)
 
 
-def wrap_param(intmagpar, extcurvepar, extinctions, mus, 
-               nband, nintmagpar, nstar, grav=None):
-    if grav is None:
-        grav = []
-    return numpy.concatenate(
-        [intmagpar.ravel(), extcurvepar.ravel(), extinctions.ravel(), mus, 
-         grav])
+def wrap_param(intmagpar, extcurvepar, starpar, 
+               nband, nintmagpar, nstar, fitpar=[]):
+    res = [intmagpar.ravel(), extcurvepar.ravel(),
+           starpar['extinction'].T.ravel(), starpar['mu']]
+    for parname in parnames:
+        if parname in fitpar:
+            res += [starpar[parname].ravel()]
+    return numpy.concatenate(res)
 
 
-def unwrap_param(param, nband, nintmagpar, nstar, nextcomp, fitgrav=False):
+def unwrap_param(param, nband, nintmagpar, nstar, nextcomp, fitpar=[]):
     i = 0
     intmagpar = param[i:i+nband*nintmagpar].reshape(nband, nintmagpar)
     i += nband*nintmagpar
     extcurvepar = param[i:i+nband*nextcomp].reshape(nextcomp, nband)
     i += nband*nextcomp
-    extinctions = param[i:i+nstar*nextcomp].reshape(nextcomp, nstar)
+    starpar = {}
+    starpar['extinction'] = (
+        param[i:i+nstar*nextcomp].reshape(nextcomp, nstar).T)
     i += nextcomp*nstar
-    mus = param[i:i+nstar]
+    starpar['mu'] = param[i:i+nstar]
     i += nstar
-    res = intmagpar, extcurvepar, extinctions, mus
-    if fitgrav:
-        grav = param[i:i+nstar]
-        i += nstar
-        res = res + (grav,)
+    res = intmagpar, extcurvepar, starpar
+    for parname in parnames:
+        if parname in fitpar:
+            starpar[parname] = param[i:i+nstar]
+            i += nstar
     if i != len(param):
         raise ValueError('shapes do not match!')
     return res
 
 
-def fit_model(mag, dmag, parallax, dparallax, teff, logz, logg, extprior,
-              extpriorsig, nextcomp=2, guess=None, fitgrav=False,
-              logg_prior_mean=None, logg_prior_sigma=None, order=3):
-    nstar = mag.shape[0]
-    nband = mag.shape[1]
+# starpar must have:
+# mag, dmag, parallax, dparallax, teff, dteff, logz, dlogz, logg, dlogg,
+# extprior, extpriorsig
+
+
+def fit_model(star, nextcomp=2, guess=None, fitpar=[], order=3, niter=3*10**5,
+              parallel=0, factr=10**7, mvec=10):
+    nstar = star['mag'].shape[0]
+    nband = star['mag'].shape[1]
     nintmagpar = len(compute_multinomials(order=order)[0])
     print('Should cut out YSOs somewhere')
     if guess is None:
@@ -351,49 +374,106 @@ def fit_model(mag, dmag, parallax, dparallax, teff, logz, logg, extprior,
                 extcurveparguess[0, :] = numpy.array(
                     [3.5, 2.7, 2.0, 1.6, 1.3, 0.8, 0.5, 0.3, 0.2, 0.2, 
                      3.5, 2.0])
-        extinctionsguess = extprior.copy()
-        musguess = parallax_to_mu(numpy.clip(parallax, 0.01, numpy.inf))
-        if fitgrav:
-            gravguess = logg
-        else:
-            gravguess = None
+        starguess = {}
+        starguess['extinction'] = star['extprior'].copy()
+        starguess['mu'] = parallax_to_mu(
+            numpy.clip(star['parallax'], 0.01, numpy.inf))
+        for parname in fitpar:
+            starguess[parname] = star[parname]
     else:
-        if fitgrav:
-            gravguess = guess[-1]
-            guess = guess[:-1]
-        else:
-            gravguess = None
-        intmagparguess, extcurveparguess, extinctionsguess, musguess = guess
+        intmagparguess, extcurveparguess, starguess = guess
     guess = wrap_param(intmagparguess, extcurveparguess,
-                       extinctionsguess, musguess, nband, nintmagpar, nstar,
-                       grav=gravguess)
+                       starguess, nband, nintmagpar, nstar,
+                       fitpar=fitpar)
     from scipy.optimize import fmin_l_bfgs_b, fmin_cg
     def chi2_wrapper(param):
         upar = unwrap_param(param, nband, nintmagpar, nstar, nextcomp, 
-                            fitgrav=fitgrav)
-        intmagpar, extcurvepar, extinctions, mus = upar[0:4]
-        if fitgrav:
-            tlogg = upar[4]
-        else:
-            tlogg = logg
-        chi2, grad = fullmodel_chi2(mag, dmag, parallax, dparallax,
-                                    intmagpar, extcurvepar, extinctions,
-                                    mus, teff, logz, tlogg, extprior,
-                                    extpriorsig, nband=nband, 
-                                    gradient=True, fitgrav=fitgrav,
-                                    logg_prior_mean=logg_prior_mean,
-                                    logg_prior_sigma=logg_prior_sigma,
+                            fitpar=fitpar)
+        intmagpar, extcurvepar, starpar = upar
+        chi2, grad = fullmodel_chi2(star,
+                                    intmagpar, extcurvepar, starpar, 
+                                    nband=nband, 
+                                    gradient=True, fitpar=fitpar,
                                     order=order)
         return chi2, grad
-    res = fmin_l_bfgs_b(chi2_wrapper, guess, m=100, iprint=10,
-                        maxiter=300000, maxfun=300000)
-    # res = fmin_cg(chi2_wrapper, guess, fprime=grad_wrapper, maxiter=10000)
+    if parallel > 0:
+        from multiprocessing import Queue, Process
+        from multiprocessing.sharedctypes import Array
+        import ctypes
+        qins = [Queue() for i in range(parallel)]
+        qout = Queue()
+        ind = numpy.floor(numpy.linspace(0, nstar, parallel+1, endpoint=True))
+        ind = ind.astype('i4')
+        npar = (nintmagpar+nextcomp)*nband+nstar*(1+nextcomp+len(fitpar))
+        grad = Array(ctypes.c_double, npar)
+        gradnp = numpy.frombuffer(grad.get_obj(), dtype='f8')
+        proclist = [
+            Process(target=worker, 
+                    args=(qins[i], qout, grad, star, nextcomp, fitpar, order, 
+                          ind[i:i+2], i)) 
+            for i in range(parallel)]
+        for p in proclist:
+            p.start()
+        def chi2_wrapper_parallel(param):
+            gradnp[:] = 0.
+            for i in range(parallel):
+                qins[i].put(param)
+            chi2 = 0.
+            for i in range(parallel):
+                tchi2 = qout.get()
+                chi2 += tchi2
+            # tgrad gets filled in by the workers; it's shared.
+            return chi2, gradnp
+        wrapper = chi2_wrapper_parallel
+    else:
+        wrapper = chi2_wrapper
+    res = fmin_l_bfgs_b(wrapper, guess, m=mvec, iprint=10,
+                        maxiter=niter, maxfun=niter, factr=factr)
+    # cg_chi2_wrapper = lambda x: wrapper(x)[0]
+    # cg_grad_wrapper = lambda x: wrapper(x)[1]
+    # res = fmin_cg(cg_chi2_wrapper, guess, fprime=cg_grad_wrapper, 
+    #               maxiter=niter)
     return res
 
-        
-def numerical_gradients(chi2gradfun, param):
+
+def worker(qin, qout, grad, star, nextcomp, fitpar, order, ind, pind):
+    nband = star['mag'].shape[1]
+    nstar = star['mag'].shape[0]
+    nextcomp = star['extprior'].shape[1]
+    npar = len(grad)
+    nperstarpar = 1+nextcomp+len(fitpar)
+    nintmagpar = (npar-nextcomp*nband-nstar*nperstarpar)//nband
+    try:
+        names = star.dtype.names
+    except:
+        names = star.keys()
+    tstar = {name: star[name][ind[0]:ind[1], ...] for name in names}
+    
+    while True:
+        param = qin.get()
+        if param is None:
+            break
+        upar = unwrap_param(param, nband, nintmagpar, nstar, nextcomp, 
+                            fitpar=fitpar)
+        intmagpar, extcurvepar, starpar = upar
+        tstarpar = {name: starpar[name][ind[0]:ind[1], ...] for name in starpar}
+        chi2, tgrad = fullmodel_chi2(tstar, intmagpar, extcurvepar, tstarpar,
+                                     nband=nband, gradient=True, fitpar=fitpar,
+                                     order=order, 
+                                     apply_extcurvenormprior=(pind == 0))
+        nsharedpar = (nintmagpar + nextcomp)*nband
+        tnstar = ind[1]-ind[0]
+        ngrad = numpy.frombuffer(grad.get_obj(), dtype='f8')
+        with grad.get_lock():
+            ngrad[0:nsharedpar] += tgrad[0:nsharedpar]
+        for i in range(nperstarpar):
+            ngrad[nsharedpar+nstar*i+ind[0]:nsharedpar+nstar*i+ind[1]] = (
+                tgrad[nsharedpar+tnstar*i:nsharedpar+tnstar*(i+1)])
+        qout.put(chi2)
+
+
+def numerical_gradients(chi2gradfun, param, dq=1e-5):
     chi2, grad = chi2gradfun(param)
-    dq = 1e-5
     res = []
     for i in range(len(param)):
         newparam = param + dq*(numpy.arange(len(param)) == i)
@@ -403,25 +483,21 @@ def numerical_gradients(chi2gradfun, param):
 
 
 def mask(ob):
-    # what do we need?
-    # good APOGEE parameters
-    # ... that's about it?
-    # that just duplicates existing selection.
     badflags1mask = 0
     badflags2mask = 0
     badflags3mask = 0
     badflags1 = [7, 8, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23, 24,
                  25, 26, 27, 28, 29, 30]
     badflags2 = [1, 2, 3, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                 20, 21, 22 ]
-    badflags3 = [8, 24, 10, 26] # chi2 warn, rotation warn, bad
+                 20, 21, 22]
+    badflags3 = [8, 24, 10, 26]  # chi2 warn, rotation warn, bad
     for f in badflags1:
         badflags1mask = badflags1mask | (2**f)
     for f in badflags2:
         badflags2mask = badflags2mask | (2**f)
     for f in badflags3:
         badflags3mask = badflags3mask | (2**f)
-    
+
     good = (((ob['apogee_target1'] & badflags1mask) == 0) &
             ((ob['apogee_target2'] & badflags2mask) == 0) &
             ((ob['aspcapflag'] & badflags3mask) == 0))
@@ -433,7 +509,7 @@ def mask(ob):
         for f in badflags4:
             ancillarymask = ancillarymask | (2**f)
         good = good & (inars | ((ob['apogee_target3'] & ancillarymask) == 0))
-    good = (good & 
+    good = (good &
             (ob['teff'] > 3500) & (ob['logg'] > -5) & (ob['m_h'] > -6))
     # PS1 is probably less blended than 2MASS/WISE, so mask all if extended
     # in PS1
@@ -532,14 +608,85 @@ def extinction_prior(ob):
     # there really aren't many nearby stars (<100 pc; these are APOGEE
     # giants, so no surprise).  So let's just do |b| > 30, D > 1 kpc.
     m = (numpy.abs(ob['b']) > 30) & (ob['parallax'] < 1)
-    extprior = numpy.zeros((2, len(ob)), dtype='f8')
-    extpriorsig = numpy.zeros((2, len(ob)), dtype='f8')
-    extprior[0, m] = dust.getval(ob['l'][m], ob['b'][m], map='sfd')*avfac
-    extpriorsig[0, m] = 0.1*extprior[0, m]
-    extpriorsig[0, m] = numpy.sqrt(extpriorsig[0, m]**2. + (0.01*avfac)**2.)
-    extpriorsig[0, ~m] = 30
-    extpriorsig[1, m] = extpriorsig[0, m]
-    extpriorsig[1, ~m] = 3
+    extprior = numpy.zeros((len(ob), 2), dtype='f8')
+    extpriorsig = numpy.zeros((len(ob), 2), dtype='f8')
+    extprior[m, 0] = dust.getval(ob['l'][m], ob['b'][m], map='sfd')*avfac
+    extpriorsig[m, 0] = 0.1*extprior[m, 0]
+    extpriorsig[m, 0] = numpy.sqrt(extpriorsig[m, 0]**2. + (0.01*avfac)**2.)
+    extpriorsig[~m, 0] = 30
+    extpriorsig[m, 1] = extpriorsig[m, 0]
+    extpriorsig[~m, 1] = 3
     # really rough guesses!
     return extprior, extpriorsig
 
+
+def redclump_cut_bovy14(teff, logz, logg, jk0):
+    tref = -382.5*logz+4607
+    z = 0.017*10.**logz
+    m = logg >= 1.8
+    m &= logg <= 0.0018*(teff - tref)+2.5
+    # most stars in APOGEE selected from Spitzer IR photometry
+    # this changes JK0 relative to Bovy's original cut slightly
+    # (extinction correction on J-K depends on W2/Spitzer)
+    m &= z > 1.21*(jk0-0.05)**9+0.0011
+    m &= z < 2.58*(jk0-0.40)**3+0.0034
+    m &= (jk0 > 0.5) & (jk0 < 0.8) & (z < 0.06)
+    m &= logg < 0.001*(teff - 4800)+2.75
+    return m
+
+
+def jk0(j, h, k, w2):
+    # Zasowski+2013
+    return (j - k)-1.5*(0.918*(h-w2-0.05))
+
+
+def gaiaflag(ob):
+    # Gaia DR2 HRD, Babusiaux+2018, performs this cut:
+    # AND phot_bp_rp_excess_factor < 1.3+0.06*power(phot_bp_mean_mag-phot_rp_mean_mag,2)
+    # AND phot_bp_rp_excess_factor > 1.0+0.015*power(phot_bp_mean_mag-phot_rp_mean_mag,2)
+    # AND visibility_periods_used>8
+    # AND astrometric_chi2_al/(astrometric_n_good_obs_al-5)<1.44*greatest(1,exp(-0.4*(phot_g_mean_mag-19.5)))
+    # plus additional cuts on SN in BP, RP, G, and parallax, that we hope the 
+    # uncertainties already cover.
+    # we duplicate that here.
+    bpmrp = ob['phot_bp_mean_mag']-ob['phot_rp_mean_mag']
+    bprpexcess = ob['phot_bp_rp_excess_factor']
+    m = bprpexcess < 1.3+0.06*bpmrp**2
+    m &= bprpexcess > 1.0+0.015*bpmrp**2
+    m &= ob['visibility_periods_used'] > 8
+    m &= (ob['astrometric_chi2_al']/(ob['astrometric_n_good_obs_al']-5) <
+          1.44*numpy.clip(numpy.exp(-0.4*(ob['phot_g_mean_mag']-19.5)), 
+                          1, numpy.inf))
+    return ~m
+
+
+# what if life is hard and just doing fmin_l_bfgs_b is not enough?
+# probably return to same ~bilinear approach we used before.
+# fix the global parameters, solve for the individual stars one-by-one
+# fix the individual stellar parameters, solve for the global parameters.
+
+# def fit_model(star, nextcomp=2, guess=None, fitpar=[], order=3, niter=3*10**5,
+#               parallel=0, factr=10**7):
+#         upar = unwrap_param(param, nband, nintmagpar, nstar, nextcomp, 
+#                             fitpar=fitpar)
+#         intmagpar, extcurvepar, starpar = upar
+#         tstarpar = {name: starpar[name][ind[0]:ind[1], ...] for name in starpar}
+#         chi2, tgrad = fullmodel_chi2(tstar, intmagpar, extcurvepar, tstarpar,
+#                                      nband=nband, gradient=True, fitpar=fitpar,
+#                                      order=order, 
+#                                      apply_extcurvenormprior=(pind == 0))
+# 
+# def fit_stars(star, intmagpar, extcurvepar, starpar, fitpar=[],
+#               order=3, damp=3, nextcomp=2):
+#     nband = star['mag'].shape[1]
+#     for i in range(len(star)):
+#         tstarpar = {name: starpar[name][i:i+1] for name in starpar}
+#         def chi(param):
+#             tstarpar['extinction'] = param[
+#             mag = fullmodel(intmagpar, extcurvepar, tstarpar,
+#                             nband=nband, gradient=False,
+#                             fitpar=fitpar, order=order)
+#             return damper((star['mag'][i]-mag)/star['dmag'][i], damp)
+#         def grad(param):
+            
+            
