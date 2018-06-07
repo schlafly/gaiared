@@ -173,7 +173,7 @@ def fullmodel(intmagpar, extcurvepar, starpar,
             nomextinctions, gradnomextinctions = nomextinctions
             gradstarpar['extinction'] = (
                 gradstarpar['extinction'][None, :, :] *
-                numpy.ones((nomextictions.shape[0], 1, 1)))
+                numpy.ones((nomextinctions.shape[0], 1, 1)))
             gradstarpar['extinction'][:, 0, :] += gradnomextinctions
     absmag += starpar['mu'].reshape(-1, 1)
     if gradient:
@@ -246,7 +246,7 @@ def fullmodel_chi2(star, intmagpar, extcurvepar, starpar,
         chi2 += numpy.sum(extchidamp**2)
         if gradient:
             delchi2[extstart:extend] += (
-                -2*extchidamp*dfdchi/star['extpriorsig']).reshape(-1)
+                -2*extchidamp*dfdchi/star['extpriorsig']).T.reshape(-1)
     if apply_extcurvenormprior and (len(extcurvepar) > 1):
         unit2normsigma = 0.1
         # chi = (1-numpy.sum(extcurvepar[1]**2))/unit2normsigma
@@ -272,7 +272,7 @@ def fullmodel_chi2(star, intmagpar, extcurvepar, starpar,
         return chi2, delchi2
     else:
         return chi2
-        
+
 
 def damper(chi, damp):
     """Pseudo-Huber loss function."""
@@ -385,7 +385,6 @@ def fit_model(star, nextcomp=2, guess=None, fitpar=[], order=3, niter=3*10**5,
     guess = wrap_param(intmagparguess, extcurveparguess,
                        starguess, nband, nintmagpar, nstar,
                        fitpar=fitpar)
-    from scipy.optimize import fmin_l_bfgs_b, fmin_cg
     def chi2_wrapper(param):
         upar = unwrap_param(param, nband, nintmagpar, nstar, nextcomp, 
                             fitpar=fitpar)
@@ -408,9 +407,9 @@ def fit_model(star, nextcomp=2, guess=None, fitpar=[], order=3, niter=3*10**5,
         grad = Array(ctypes.c_double, npar)
         gradnp = numpy.frombuffer(grad.get_obj(), dtype='f8')
         proclist = [
-            Process(target=worker, 
-                    args=(qins[i], qout, grad, star, nextcomp, fitpar, order, 
-                          ind[i:i+2], i)) 
+            Process(target=worker,
+                    args=(qins[i], qout, grad, star, nextcomp, fitpar, order,
+                          ind[i:i+2], i))
             for i in range(parallel)]
         for p in proclist:
             p.start()
@@ -427,6 +426,7 @@ def fit_model(star, nextcomp=2, guess=None, fitpar=[], order=3, niter=3*10**5,
         wrapper = chi2_wrapper_parallel
     else:
         wrapper = chi2_wrapper
+    from scipy.optimize import fmin_l_bfgs_b, fmin_cg
     res = fmin_l_bfgs_b(wrapper, guess, m=mvec, iprint=10,
                         maxiter=niter, maxfun=niter, factr=factr)
     # cg_chi2_wrapper = lambda x: wrapper(x)[0]
@@ -521,7 +521,7 @@ def mask(ob):
     return good
 
 
-def xmatch_to_good_output(xmatch):
+def xmatch_to_good_output(xmatch, nextcomp=0):
     # xmatch file contains all of the columns from all of the
     # APOGEE objects, matched to Gaia/PS1/WISE
     # we want to select this down to the good subsample
@@ -568,14 +568,18 @@ def xmatch_to_good_output(xmatch):
     if numpy.any(unc <= 0):
         m = unc <= 0
         unc[m] = numpy.inf
+    dtype = [('ra', 'f8'), ('dec', 'f8'), 
+             ('l', 'f8'), ('b', 'f8'),
+             ('mag', 'f8', 12), ('dmag', 'f8', 12),
+             ('parallax', 'f8'), ('dparallax', 'f8'),
+             ('teff', 'f8'), ('dteff', 'f8'),
+             ('logz', 'f8'), ('dlogz', 'f8'),
+             ('logg', 'f8'), ('dlogg', 'f8')]
+    if nextcomp > 0:
+        dtype += [('extprior', '%df8' % nextcomp),
+                  ('extpriorsig', '%df8' % nextcomp)]
     res = numpy.zeros(len(xmatch), 
-                      dtype=[('ra', 'f8'), ('dec', 'f8'), 
-                             ('l', 'f8'), ('b', 'f8'),
-                             ('mag', 'f8', 12), ('dmag', 'f8', 12),
-                             ('parallax', 'f8'), ('dparallax', 'f8'),
-                             ('teff', 'f8'), ('dteff', 'f8'),
-                             ('logz', 'f8'), ('dlogz', 'f8'),
-                             ('logg', 'f8'), ('dlogg', 'f8')])
+                      dtype=dtype)
     res['mag'] = mag
     res['dmag'] = unc
     res['parallax'] = xmatch['parallax']
@@ -596,6 +600,8 @@ def xmatch_to_good_output(xmatch):
     res['ra'] = xmatch['ra']
     res['dec'] = xmatch['dec']
     res['l'], res['b'] = xmatch['glon'], xmatch['glat']
+    if nextcomp > 0:
+        res['extpriorsig'] = numpy.inf
     return res, xmatch
 
 
